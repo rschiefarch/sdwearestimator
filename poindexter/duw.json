@@ -2,12 +2,12 @@
   "files" : [ {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
-    "path" : "/README.md",
-    "desc" : "added --initial-health option documentation"
+    "path" : "/src/main.rs",
+    "desc" : "reduced wear sample ring buffer to 28 entries at 6-hour intervals (7 days)"
   }, {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
-    "path" : "/src/main.rs",
-    "desc" : "fix typo: missing multiply operator in card_gb calculation"
+    "path" : "/README.md",
+    "desc" : "updated to reflect key=value output format, yrs_left field, and wear sample ring buffer"
   } ]
 }

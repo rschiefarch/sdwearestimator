@@ -41,7 +41,8 @@ SD cards use NAND flash memory which has a finite number of **Program/Erase (P/E
 3. Applies a **fullness multiplier** — a fuller card means more garbage collection pressure and higher WAF
 4. Accumulates **estimated flash bytes written** over time
 5. Derives the **average P/E cycle count** across the card and the **remaining life percentage**
-6. Persists all state to a JSON file so tracking survives reboots
+6. Maintains a **rolling 7-day wear rate ring buffer** (4 samples per day, every 6 hours) to extrapolate how many years of write life remain at the current rate of use
+7. Persists all state to a JSON file so tracking survives reboots and daemon restarts
 
 It does **not** require any special kernel modules, hardware access, or SD card vendor tools. Everything is derived from standard Linux sysfs and procfs interfaces.
 
@@ -53,6 +54,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 - 🔍 **Auto-detects erase block size** from `/sys/block/<dev>/queue/`
 - 🔍 **Auto-detects mount points** by cross-referencing `/sys/block/` partitions with `/proc/mounts`
 - 📊 **Fullness-aware WAF estimation** — accounts for GC pressure as the card fills up
+- 📈 **Years-left extrapolation** — rolling 7-day wear rate used to estimate remaining write life in years
 - 💾 **Persistent state** across reboots via a human-readable JSON file
 - ⚙️ **systemd compatible** — designed to run as a background service
 - 🦀 **Single binary**, no runtime dependencies
@@ -174,17 +176,37 @@ Lifetime budget: 384.0 TB total flash writes
 ─────────────────────────────────────────────────────────────
 Restored state: 0.000012 avg P/E cycles, 99.9988% life remaining
 ─────────────────────────────────────────────────────────────
-      Δ IOs       Δ KB   Avg KB    WAF   Full%      Avg P/E   Life %
-         12        480     40.0   1.23   42.3%     0.000013  99.9987%
 ```
 
-Each row is printed when write activity is detected during a poll interval.
+Each time write activity is detected during a poll interval, a labeled key=value line is printed:
+
+```
+ios=12 kb=480 avg_kb=40.0 waf=1.23 full=42.3% pe=0.000013 life=99.9987% yrs_left=4.5y
+ios=8  kb=320 avg_kb=40.0 waf=1.23 full=42.4% pe=0.000014 life=99.9986% yrs_left=4.5y
+```
+
+The key=value format means each line is fully self-describing in the systemd journal even when
+the startup header has long since scrolled out of view.
+
+| Field | Description |
+|---|---|
+| `ios` | Number of write IOs observed this poll interval |
+| `kb` | Kilobytes written to the device this poll interval (host side) |
+| `avg_kb` | Average IO size in KB this poll interval |
+| `waf` | Estimated Write Amplification Factor this poll interval |
+| `full` | Filesystem fullness % (worst partition) — drives the WAF multiplier |
+| `pe` | Cumulative estimated average P/E cycles consumed across the card |
+| `life` | Estimated remaining life as % of rated P/E endurance |
+| `yrs_left` | Extrapolated years of write life remaining at the current rolling wear rate. Shows `n/a` for the first 6 hours (not enough history yet), and `>100y` when the rate is so low the card is effectively not wearing out. |
 
 ---
 
 ## State File
 
-State is persisted to a human-readable JSON file (default `/var/lib/sdwear/state.json`). This file is designed to be self-describing — you can read it at any time to check card health without running any tools:
+State is persisted to a human-readable JSON file (default `/var/lib/sdwear/state.json`). This file is designed to be self-describing — you can read it at any time to check card health without running any tools.
+
+The ring buffer of wear samples is also persisted here, so the rolling rate estimate and `yrs_left`
+extrapolation survive daemon restarts and reboots without losing history.
 
 ```json
 {
@@ -208,7 +230,13 @@ State is persisted to a human-readable JSON file (default `/var/lib/sdwear/state
   "last_kernel_write_ios": 98765,
   "first_started": "1709123456",
   "last_updated": "1709456789",
-  "reboot_count": 2
+  "reboot_count": 2,
+  "wear_samples": [
+    { "timestamp_secs": 1709100000, "flash_bytes_written": 900000000 },
+    { "timestamp_secs": 1709121600, "flash_bytes_written": 940000000 },
+    { "timestamp_secs": 1709143200, "flash_bytes_written": 987654321 }
+  ],
+  "last_sample_timestamp": 1709143200
 }
 ```
 
@@ -221,6 +249,8 @@ The key fields for card health are:
 | `initial_health_pct` | Health % that monitoring started at (100.0 = brand new; lower if `--initial-health` was used) |
 | `filesystem_fullness_pct` | How full the card was at last save — affects WAF |
 | `reboot_count` | Number of reboots detected since monitoring began |
+| `wear_samples` | Rolling ring buffer of 6-hourly wear snapshots (max 28 entries = 7 days) used to compute the `yrs_left` extrapolation |
+| `last_sample_timestamp` | Unix timestamp of the most recent wear sample push |
 
 ---
 
@@ -285,6 +315,26 @@ The `0.15` efficiency factor models the FTL's log-structured write buffering —
 | > 95% | 2.0× |
 
 A fuller card means the FTL has less room to manoeuvre, forcing more frequent and less efficient garbage collection.
+
+---
+
+## Years Remaining Extrapolation
+
+The `yrs_left` value is derived from a **rolling 7-day wear rate ring buffer**. Every 6 hours a snapshot of `(timestamp, cumulative_flash_bytes_written)` is saved to the state file. Up to 28 snapshots are retained (4 per day × 7 days), adding only ~1.8 KB to the state file at full capacity.
+
+To compute `yrs_left`:
+1. Take the oldest snapshot in the buffer as the start of the window
+2. Compute the wear rate: `bytes_written_in_window / elapsed_seconds`
+3. Compute remaining flash capacity: `(life_remaining_pct / 100) × pe_cycles × card_bytes`
+4. Extrapolate: `remaining_capacity / wear_rate / seconds_per_year`
+
+| Display value | Meaning |
+|---|---|
+| `n/a` | Fewer than 2 samples in the buffer — need at least 6 hours of history |
+| `4.5y` | Estimated years remaining at current rolling wear rate |
+| `>100y` | Rate is so low the card is effectively not wearing out at current usage |
+
+The estimate naturally adapts as usage patterns change — a period of heavy writes will pull the estimate down, and a quieter period will let it recover upward. The 7-day window strikes a balance between responsiveness and stability.
 
 ---
 

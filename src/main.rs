@@ -5,6 +5,8 @@
 // altered by Poindexter AI: fix erase block zero bug; add LUKS/dm-crypt mount detection via /sys/block/<dev>/holders
 // altered by Poindexter AI: add #[serde(default)] to all State fields for backwards compatibility with older state files
 // altered by Poindexter AI: added --initial-health argument to preset starting life % for a card already in use
+// altered by Poindexter AI: added 30-day rolling wear rate ring buffer and yrs_left extrapolation; switched to key=value output format
+// altered by Poindexter AI: reduced wear sample ring buffer to 28 entries at 6-hour intervals (7 days, ~1.8 KB max)
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -72,6 +74,32 @@ fn default_initial_health() -> f64 {
     100.0
 }
 
+// ─── Wear sample for the rolling rate ring buffer ───
+//
+// Each sample records a unix timestamp (seconds) and the cumulative estimated
+// flash bytes written at that point in time. Samples are pushed once every
+// 6 hours (21600 seconds). The ring buffer holds at most WEAR_SAMPLE_MAX
+// entries (28 = 7 days × 4 samples per day).
+//
+// To estimate the wear rate we look at the oldest sample in the buffer and
+// compute bytes-per-second over the window it spans, then extrapolate to years.
+
+/// Maximum number of wear samples retained in the ring buffer.
+/// 4 samples/day × 7 days = 28 entries. At ~65 bytes per entry in pretty-printed
+/// JSON this keeps the state file contribution from the buffer to ~1.8 KB max.
+const WEAR_SAMPLE_MAX: usize = 28; // 7 days × 4 samples per day
+
+/// Minimum seconds between wear samples (6 hours)
+const WEAR_SAMPLE_INTERVAL_SECS: u64 = 21600;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct WearSample {
+    /// Unix timestamp (seconds since epoch) when this sample was taken
+    timestamp_secs: u64,
+    /// Cumulative estimated flash bytes written at the time of this sample
+    flash_bytes_written: u64,
+}
+
 // ─── Persistent state: survives reboots ───
 //
 // This struct is serialised to JSON. It is designed to be human-readable
@@ -79,10 +107,11 @@ fn default_initial_health() -> f64 {
 // health of the SD card without needing to know the program arguments
 // that were used to start the daemon.
 //
-// Fields are grouped into three sections:
+// Fields are grouped into four sections:
 //   1. Descriptor fields  — what device/card this file relates to
 //   2. Cumulative metrics — the wear tracking numbers
 //   3. Internal counters  — used by the algorithm for delta/reboot detection
+//   4. Rolling wear rate ring buffer — 6-hourly snapshots for yrs_left estimation
 //
 // Every field carries #[serde(default)] so that if a field is absent in an
 // older state file (e.g. from a previous version of the binary that didn't
@@ -181,6 +210,21 @@ struct State {
     /// Number of reboots detected since monitoring began
     #[serde(default)]
     reboot_count: u64,
+
+    // ── Section 4: Rolling wear rate ring buffer ──
+    //
+    // Snapshots of (timestamp, cumulative_flash_bytes_written) taken every 6 hours.
+    // Capped at WEAR_SAMPLE_MAX (28) entries = 7 days of history.
+    // Used to compute a rolling wear rate for the yrs_left extrapolation.
+    // Older entries are evicted from the front when the buffer is full.
+
+    /// 6-hourly wear samples for rolling rate calculation (max 28 = 7 days)
+    #[serde(default)]
+    wear_samples: Vec<WearSample>,
+
+    /// Unix timestamp of the last wear sample push
+    #[serde(default)]
+    last_sample_timestamp: u64,
 }
 
 impl State {
@@ -214,6 +258,10 @@ impl State {
             first_started: now.clone(),
             last_updated: now,
             reboot_count: 0,
+
+            // Rolling wear rate ring buffer — empty on first start
+            wear_samples: Vec::new(),
+            last_sample_timestamp: 0,
         }
     }
 }
@@ -499,6 +547,123 @@ fn estimate_waf(
     base_waf * fullness_multiplier
 }
 
+// ─── Rolling wear rate ring buffer management ───
+//
+// We push one sample every WEAR_SAMPLE_INTERVAL_SECS (6 hours) into the ring
+// buffer. When the buffer reaches WEAR_SAMPLE_MAX (28) entries the oldest entry
+// is evicted from the front, keeping a rolling 7-day window.
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Push a new wear sample if at least WEAR_SAMPLE_INTERVAL_SECS (6 hours) have
+/// elapsed since the last sample. Evicts the oldest entry when the buffer is
+/// full (28 entries = 7 days at 4 samples/day).
+fn maybe_push_wear_sample(state: &mut State) {
+    let now = now_secs();
+
+    // Only push a sample if the configured interval has elapsed since the last one
+    if now.saturating_sub(state.last_sample_timestamp) < WEAR_SAMPLE_INTERVAL_SECS {
+        return;
+    }
+
+    // Evict the oldest sample if we are at capacity to keep the buffer bounded
+    if state.wear_samples.len() >= WEAR_SAMPLE_MAX {
+        state.wear_samples.remove(0);
+    }
+
+    // Push the current snapshot
+    state.wear_samples.push(WearSample {
+        timestamp_secs: now,
+        flash_bytes_written: state.estimated_flash_bytes_written,
+    });
+
+    state.last_sample_timestamp = now;
+}
+
+// ─── Years-left extrapolation ───
+//
+// Uses the rolling wear rate ring buffer to estimate how many years of write
+// life remain on the card at the current rate of wear.
+//
+// Algorithm:
+//   1. Take the oldest sample in the ring buffer as the start of the window
+//      (up to 7 days ago).
+//   2. Compute bytes written and time elapsed over that window.
+//   3. Derive a wear rate in bytes/second.
+//   4. Compute remaining flash bytes capacity:
+//        remaining_bytes = (life_remaining_pct / 100) * pe_cycles_rated * card_bytes
+//   5. years_left = remaining_bytes / wear_rate / seconds_per_year
+//
+// Returns None if:
+//   - The ring buffer has fewer than 2 samples (not enough data yet — need at
+//     least 6 hours of history before the first estimate is produced)
+//   - The time window is zero (shouldn't happen but guard anyway)
+//   - The wear rate is zero (no writes have occurred in the window)
+//
+// Returns Some(f64) capped at 100.0 — values above 100 years are displayed
+// as ">100y" since they are not meaningfully actionable.
+
+fn estimate_years_left(state: &State, card_bytes: u64, pe_cycles: u64) -> Option<f64> {
+    // Need at least two samples to compute a rate
+    if state.wear_samples.len() < 2 {
+        return None;
+    }
+
+    // The oldest sample defines the start of the rolling window (up to 7 days ago)
+    let oldest = &state.wear_samples[0];
+    let now_ts = now_secs();
+
+    // Time elapsed over the window in seconds
+    let elapsed_secs = now_ts.saturating_sub(oldest.timestamp_secs);
+    if elapsed_secs == 0 {
+        return None;
+    }
+
+    // Flash bytes written during the window
+    let bytes_in_window = state.estimated_flash_bytes_written
+        .saturating_sub(oldest.flash_bytes_written);
+
+    // If no bytes were written in the window the rate is zero — cannot extrapolate
+    if bytes_in_window == 0 {
+        return None;
+    }
+
+    // Wear rate in bytes per second over the rolling window
+    let bytes_per_sec = bytes_in_window as f64 / elapsed_secs as f64;
+
+    // Total flash write capacity of the card:
+    //   capacity = pe_cycles_rated * card_bytes
+    // Remaining capacity based on current life percentage:
+    //   remaining = (life_remaining_pct / 100.0) * capacity
+    let remaining_flash_bytes =
+        (state.estimated_life_remaining_pct / 100.0) * (pe_cycles as f64 * card_bytes as f64);
+
+    // Seconds per year (365.25 days to account for leap years)
+    let secs_per_year = 365.25 * 24.0 * 3600.0;
+
+    let years = remaining_flash_bytes / bytes_per_sec / secs_per_year;
+
+    // Cap at 100.0 — anything above this is displayed as ">100y"
+    Some(years.min(100.0))
+}
+
+/// Format the years-left value for display in the output line.
+/// - None            → "n/a"   (not enough data yet — less than 6 hours of history)
+/// - Some(100.0)     → ">100y" (capped — effectively infinite at current rate)
+/// - Some(x)         → "4.5y"  (one decimal place)
+fn format_years_left(years: Option<f64>) -> String {
+    match years {
+        None => "n/a".to_string(),
+        Some(y) if y >= 100.0 => ">100y".to_string(),
+        Some(y) => format!("{:.1}y", y),
+    }
+}
+
 // ─── Persistence ───
 
 fn load_state(path: &PathBuf) -> State {
@@ -519,10 +684,7 @@ fn save_state(path: &PathBuf, state: &State) -> Result<()> {
 
 fn now_string() -> String {
     // Simple unix timestamp without pulling in chrono
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}", d.as_secs())
+    format!("{}", now_secs())
 }
 
 // ─── Main loop ───
@@ -677,10 +839,6 @@ fn main() -> Result<()> {
         state.estimated_avg_pe_cycles, state.estimated_life_remaining_pct
     );
     println!("─────────────────────────────────────────────────────────────");
-    println!(
-        "{:>10} {:>10} {:>8} {:>6} {:>8} {:>12} {:>8}",
-        "Δ IOs", "Δ KB", "Avg KB", "WAF", "Full%", "Avg P/E", "Life %"
-    );
 
     let mut prev = current;
 
@@ -732,8 +890,20 @@ fn main() -> Result<()> {
                 ((1.0 - (state.estimated_avg_pe_cycles / args.pe_cycles as f64)) * 100.0)
                     .clamp(0.0, 100.0);
 
+            // ── Push 6-hourly wear sample into the rolling ring buffer ──
+            // Called on every write-active poll tick but internally only records
+            // a sample once every 6 hours (WEAR_SAMPLE_INTERVAL_SECS).
+            maybe_push_wear_sample(&mut state);
+
+            // ── Compute years-left extrapolation from rolling wear rate ──
+            let years_left = estimate_years_left(&state, card_bytes, args.pe_cycles);
+            let years_str = format_years_left(years_left);
+
+            // ── Print labeled key=value output line ──
+            // Using key=value format so each line is self-describing in the
+            // systemd journal even when the header has scrolled out of view.
             println!(
-                "{:>10} {:>10} {:>8.1} {:>6.2} {:>7.1}% {:>12.6} {:>7.4}%",
+                "ios={} kb={} avg_kb={:.1} waf={:.2} full={:.1}% pe={:.6} life={:.4}% yrs_left={}",
                 delta_ios,
                 delta_kb,
                 avg_io_kb,
@@ -741,6 +911,7 @@ fn main() -> Result<()> {
                 fullness * 100.0,
                 state.estimated_avg_pe_cycles,
                 state.estimated_life_remaining_pct,
+                years_str,
             );
         }
 
