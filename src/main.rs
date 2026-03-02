@@ -1,7 +1,9 @@
 // src/main.rs
-// altered by Apiro Poindexter AI: added --save-interval argument to replace hardcoded 60-tick save period
-// altered by Apiro Poindexter AI: auto-detect card size, erase block size, and filesystem fullness for WAF multiplier
-// altered by Apiro Poindexter AI: added human-readable descriptor fields to persisted state JSON
+// altered by Poindexter AI: added --save-interval argument to replace hardcoded 60-tick save period
+// altered by Poindexter AI: auto-detect card size, erase block size, and filesystem fullness for WAF multiplier
+// altered by Poindexter AI: added human-readable descriptor fields to persisted state JSON
+// altered by Poindexter AI: fix erase block zero bug; add LUKS/dm-crypt mount detection via /sys/block/<dev>/holders
+// altered by Poindexter AI: add #[serde(default)] to all State fields for backwards compatibility with older state files
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,6 +43,21 @@ struct Args {
     save_interval: u64,
 }
 
+// ─── Serde default helpers ───
+//
+// Serde's #[serde(default)] attribute uses the Default trait for primitive types
+// (giving 0, false, empty string etc). For fields where the correct default is
+// something other than zero we need a small helper function that serde can call.
+//
+// This is what makes the state file backwards compatible — if a field is missing
+// from an older JSON file, serde will call the appropriate default function
+// rather than failing the entire deserialisation.
+
+/// Default life remaining is 100% (brand new card, no wear recorded)
+fn default_life_remaining() -> f64 {
+    100.0
+}
+
 // ─── Persistent state: survives reboots ───
 //
 // This struct is serialised to JSON. It is designed to be human-readable
@@ -52,6 +69,12 @@ struct Args {
 //   1. Descriptor fields  — what device/card this file relates to
 //   2. Cumulative metrics — the wear tracking numbers
 //   3. Internal counters  — used by the algorithm for delta/reboot detection
+//
+// Every field carries #[serde(default)] so that if a field is absent in an
+// older state file (e.g. from a previous version of the binary that didn't
+// have that field yet), deserialisation succeeds rather than failing and
+// losing all accumulated wear history. This makes the state file format
+// forwards and backwards compatible across binary upgrades.
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct State {
@@ -60,63 +83,82 @@ struct State {
     // These are refreshed on every save so the file is always self-describing.
 
     /// The block device being monitored (e.g. "mmcblk0")
+    #[serde(default)]
     device: String,
 
     /// Card capacity in GB as reported by the kernel (human readable)
+    #[serde(default)]
     card_size_gb: f64,
 
     /// Card capacity in exact bytes as reported by the kernel
+    #[serde(default)]
     card_size_bytes: u64,
 
     /// Erase block size in KB (auto-detected or user override)
+    #[serde(default)]
     erase_block_kb: u64,
 
     /// Rated P/E cycle endurance used for life% calculation
+    #[serde(default)]
     pe_cycles_rated: u64,
 
-    /// Mount points detected for this device's partitions at last save
+    /// Mount points detected for this device's partitions at last save.
+    /// Includes direct mounts and mounts via dm-crypt/LUKS device mapper volumes.
+    #[serde(default)]
     mount_points: Vec<String>,
 
     /// Filesystem fullness percentage at last save (worst partition, drives WAF multiplier)
+    #[serde(default)]
     filesystem_fullness_pct: f64,
 
     // ── Section 2: Cumulative wear metrics ──
 
     /// Cumulative 512-byte sectors written as seen from host side
+    #[serde(default)]
     total_host_sectors_written: u64,
 
     /// Cumulative write IO count from host side
+    #[serde(default)]
     total_host_write_ios: u64,
 
     /// Cumulative estimated bytes actually written to flash (after WAF adjustment)
+    #[serde(default)]
     estimated_flash_bytes_written: u64,
 
     /// ★ THE KEY NUMBER ★
     /// Estimated average P/E cycle count per erase block across the whole card.
     /// Calculated as: estimated_flash_bytes_written / card_size_bytes
     /// When this approaches pe_cycles_rated the card is near end of life.
+    #[serde(default)]
     estimated_avg_pe_cycles: f64,
 
     /// Estimated remaining life as a percentage of rated P/E endurance.
-    /// 100.0 = brand new, 0.0 = end of rated life
+    /// 100.0 = brand new, 0.0 = end of rated life.
+    /// Default is 100.0 (not 0.0) — a missing field means no wear recorded yet.
+    #[serde(default = "default_life_remaining")]
     estimated_life_remaining_pct: f64,
 
     // ── Section 3: Internal algorithm counters ──
 
     /// Raw kernel write sector counter at last poll — used to compute deltas
     /// and detect reboots (kernel counters reset to 0 on boot)
+    #[serde(default)]
     last_kernel_write_sectors: u64,
 
     /// Raw kernel write IO counter at last poll
+    #[serde(default)]
     last_kernel_write_ios: u64,
 
     /// Unix timestamp when monitoring first started on this card
+    #[serde(default)]
     first_started: String,
 
     /// Unix timestamp of the last state file save
+    #[serde(default)]
     last_updated: String,
 
     /// Number of reboots detected since monitoring began
+    #[serde(default)]
     reboot_count: u64,
 }
 
@@ -201,9 +243,15 @@ fn detect_card_bytes(device: &str) -> Result<u64> {
 //   2. optimal_io_size — the controller's preferred IO alignment, often
 //      matches the erase block size
 //
-// Both are in bytes. If neither gives a sensible value (> 0 and a power of 2)
-// we fall back to 4 MB (4096 KB) which is a reasonable default for modern
-// consumer SD cards.
+// Both are in bytes. The value must be:
+//   - Greater than zero
+//   - A power of two
+//   - At least 64 KB (values smaller than this are not realistic erase block
+//     sizes and indicate the driver is reporting a logical rather than physical
+//     geometry — USB devices in particular often report misleadingly small values)
+//
+// If neither attribute gives a sensible value we fall back to 4 MB (4096 KB)
+// which is a reasonable default for modern consumer SD and USB flash devices.
 //
 // The user can always override with --erase-block-kb if they know better.
 
@@ -211,16 +259,22 @@ fn detect_erase_block_bytes(device: &str) -> u64 {
     // Fallback default: 4 MB erase block
     let fallback: u64 = 4096 * 1024;
 
-    // Helper: read a sysfs queue attribute as u64 bytes
+    // Minimum plausible erase block size — anything smaller is almost certainly
+    // a logical block size being reported rather than a physical erase block size.
+    // USB mass storage devices in particular often report 512 or 4096 bytes here.
+    let min_plausible_bytes: u64 = 64 * 1024; // 64 KB
+
+    // Helper: read a sysfs queue attribute as u64 bytes, applying sanity checks
     let read_queue_attr = |attr: &str| -> Option<u64> {
         let path = format!("/sys/block/{}/queue/{}", device, attr);
         fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&v| v > 0 && v.is_power_of_two())
+            // Must be non-zero, a power of two, and at least 64 KB to be plausible
+            .filter(|&v| v >= min_plausible_bytes && v.is_power_of_two())
     };
 
-    // Try discard_granularity first, then optimal_io_size
+    // Try discard_granularity first (most reliable for flash devices), then optimal_io_size
     read_queue_attr("discard_granularity")
         .or_else(|| read_queue_attr("optimal_io_size"))
         .unwrap_or(fallback)
@@ -228,16 +282,29 @@ fn detect_erase_block_bytes(device: &str) -> u64 {
 
 // ─── Auto-detect mount points for this device ───
 //
-// Strategy:
-//   1. List partition subdirectories under /sys/block/<dev>/ that match
-//      the device name prefix (e.g. mmcblk0p1, mmcblk0p2). Also include
-//      the raw device itself in case it is mounted directly without partitions.
-//   2. Parse /proc/mounts to find which of those partitions are mounted
-//      and at which mount points.
-//   3. Return a list of (partition, mount_point) pairs.
+// This function handles three cases:
+//
+//   Case 1 — Direct mount: partition is mounted directly
+//     e.g. /dev/mmcblk0p2 -> /
+//
+//   Case 2 — No partition table: raw device is mounted directly
+//     e.g. /dev/sda -> /mnt/data
+//
+//   Case 3 — LUKS/dm-crypt: device is encrypted, the decrypted mapper
+//     device is what gets mounted, not the raw device itself.
+//     e.g. /dev/sda -> (LUKS) -> /dev/mapper/enc -> /mnt/enc
+//
+//     For case 3 we look in /sys/block/<dev>/holders/ which lists the
+//     device mapper (dm-*) devices that sit on top of this block device.
+//     We then read the dm device's name from /sys/block/dm-N/dm/name
+//     to get the mapper name (e.g. "enc"), construct /dev/mapper/enc,
+//     and check /proc/mounts for that.
+//
+// Returns a list of (mounted_device, mount_point) pairs.
 
 fn find_mount_points(device: &str) -> Vec<(String, String)> {
-    // Build the set of candidate device names: the device itself plus its partitions
+    // Build the set of candidate device paths to look for in /proc/mounts.
+    // Start with the raw device and all its direct partitions.
     let mut candidates: Vec<String> = vec![format!("/dev/{}", device)];
 
     // Scan /sys/block/<dev>/ for partition subdirectories
@@ -245,14 +312,42 @@ fn find_mount_points(device: &str) -> Vec<(String, String)> {
     if let Ok(entries) = fs::read_dir(&sys_path) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Partition directories start with the device name (e.g. mmcblk0p1)
+            // Partition directories start with the device name (e.g. mmcblk0p1, sda1)
             if name.starts_with(device) {
                 candidates.push(format!("/dev/{}", name));
             }
         }
     }
 
-    // Parse /proc/mounts: each line is "<device> <mountpoint> <fstype> <options> 0 0"
+    // ── Case 3: LUKS/dm-crypt holder detection ──
+    //
+    // Check /sys/block/<dev>/holders/ for device mapper children.
+    // Each entry is a symlink to a dm-N device that sits on top of this device.
+    // We resolve the dm device name via /sys/block/dm-N/dm/name to get the
+    // mapper name, then add /dev/mapper/<name> as a candidate.
+    let holders_path = format!("/sys/block/{}/holders", device);
+    if let Ok(entries) = fs::read_dir(&holders_path) {
+        for entry in entries.flatten() {
+            let holder_name = entry.file_name().to_string_lossy().to_string();
+
+            // holders/ entries are dm-N device names
+            if holder_name.starts_with("dm-") {
+                // Read the human-readable mapper name from the dm device's sysfs entry
+                // e.g. /sys/block/dm-0/dm/name -> "enc"
+                let dm_name_path = format!("/sys/block/{}/dm/name", holder_name);
+                if let Ok(mapper_name) = fs::read_to_string(&dm_name_path) {
+                    let mapper_name = mapper_name.trim();
+                    if !mapper_name.is_empty() {
+                        // Add /dev/mapper/<name> as a candidate mount device
+                        candidates.push(format!("/dev/mapper/{}", mapper_name));
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse /proc/mounts and find all entries matching our candidates.
+    // Format: "<device> <mountpoint> <fstype> <options> 0 0"
     let mounts_content = match fs::read_to_string("/proc/mounts") {
         Ok(c) => c,
         Err(_) => return vec![],
@@ -352,6 +447,12 @@ fn estimate_waf(
         return 1.0;
     }
 
+    // Guard against a zero erase block size — should not happen after the
+    // detection fix but we defend here as well to avoid a divide-by-zero panic
+    if erase_block_bytes == 0 {
+        return 1.0;
+    }
+
     let avg_io_bytes = (delta_sectors * 512) as f64 / delta_ios as f64;
 
     // Base WAF from IO size vs erase block size
@@ -425,6 +526,7 @@ fn main() -> Result<()> {
     let erase_block_kb = erase_block_bytes / 1024;
 
     // ── Find all mount points for this device's partitions ──
+    // This includes direct mounts and mounts via LUKS/dm-crypt device mapper volumes.
     let mount_points = find_mount_points(&args.device);
 
     // Build a flat list of mount point strings for storage in state JSON

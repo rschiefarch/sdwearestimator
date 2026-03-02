@@ -1,0 +1,8 @@
+{
+  "files" : [ {
+    "dexUnit" : "sdestimator",
+    "workSpec" : "none",
+    "path" : "/src/main.rs",
+    "desc" : "add serde default to all State fields for backwards compatibility with older state files"
+  } ]
+}
