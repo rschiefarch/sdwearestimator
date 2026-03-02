@@ -1,0 +1,23 @@
+# sample systemd unit
+
+[Unit]
+Description=SD Card Flash Wear Estimator
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sdestimator --device mmcblk0 --save-interval 600 --pe-cycles 1500 --interval 5 --state-file /opt/lib/sdwear/state.json
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# ensure the state directory exists before starting
+ExecStartPre=/bin/mkdir -p /opt/lib/sdwear
+
+# run as root so it can read /sys/block stats and write state file
+User=root
+
+[Install]
+WantedBy=multi-user.target

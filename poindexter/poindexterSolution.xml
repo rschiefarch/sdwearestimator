@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dexSolution>
+    <name>SDWAER</name>
+    <description>
+        this is an embedded rust project for esp32 soc
+    </description>
+    <dexUnitRefs>
+        <dexUnitRef>
+            <refDir>../</refDir>
+            <readOnly>false</readOnly>
+        </dexUnitRef>
+    </dexUnitRefs>
+</dexSolution>
