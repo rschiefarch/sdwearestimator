@@ -6,7 +6,7 @@ Designed primarily for always-on embedded Linux systems such as the **Raspberry 
 
 ## Tips to Minimise SD Card Wear
 
-For Raspberry Pi and other SBCs that mount root on an SD card, consider the following:
+For Raspberry Pi and other SBCs that mount root on an SD card, consider the following (they can potentially extend the life of your sd card by years):
 
 ### Tools
 - **log2ram** — mounts `/var/log` in RAM and only flushes to disk periodically, dramatically reducing log write wear
