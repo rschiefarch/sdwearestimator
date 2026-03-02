@@ -2,17 +2,17 @@
   "files" : [ {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
-    "path" : "/src/main.rs",
-    "desc" : "Changed ring buffer sample interval from 6 hours (21600s) to 24 hours (86400s) so 28 entries cover 28 days instead of 7"
-  }, {
-    "dexUnit" : "sdestimator",
-    "workSpec" : "none",
     "path" : "/Cargo.toml",
     "desc" : "Removed unused dependencies (tokio, chrono, time), added nix with fs feature"
   }, {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
+    "path" : "/src/main.rs",
+    "desc" : "Replace erase-block-based WAF model with page-size + GC model with sequential ratio detection"
+  }, {
+    "dexUnit" : "sdestimator",
+    "workSpec" : "none",
     "path" : "/README.md",
-    "desc" : "Added musl static build instructions and noted ~668 KB RSS footprint on Raspberry Pi 4"
+    "desc" : "Update WAF model description and add new CLI args for flash-page-size and over-provision"
   } ]
 }

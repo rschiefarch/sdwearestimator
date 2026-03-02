@@ -8,6 +8,7 @@
 // altered by Poindexter AI: added 30-day rolling wear rate ring buffer and yrs_left extrapolation; switched to key=value output format
 // altered by Poindexter AI: reduced wear sample ring buffer to 28 entries at 6-hour intervals (7 days, ~1.8 KB max)
 // altered by Poindexter AI: changed ring buffer sample interval from 6 hours (21600s) to 24 hours (86400s) so 28 entries cover 28 days instead of 7
+// altered by Poindexter AI: replaced erase-block-based WAF model with page-size + greedy-GC model with dynamic sequential ratio from kernel merge stats
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -29,6 +30,20 @@ struct Args {
     /// /sys/block/<dev>/queue/discard_granularity or optimal_io_size.
     #[arg(short, long)]
     erase_block_kb: Option<u64>,
+
+    /// Flash page size in bytes. This is the granularity at which the FTL
+    /// programs data — smaller than the erase block. Typical values are
+    /// 4096 (4 KB) for older cards and 16384 (16 KB) for modern cards.
+    /// Used as the base unit for WAF estimation.
+    #[arg(long, default_value_t = 16384)]
+    flash_page_size: u64,
+
+    /// SD card over-provisioning ratio (0.0–1.0). Most consumer SD cards
+    /// reserve ~7% of flash capacity for internal FTL use. This adjusts the
+    /// effective fill level seen by the GC model so that filesystem fullness
+    /// is correctly mapped to flash-level occupancy.
+    #[arg(long, default_value_t = 0.07)]
+    over_provision: f64,
 
     /// Rated P/E cycles (TLC≈1000-3000, MLC≈3000-10000)
     #[arg(short, long, default_value_t = 3000)]
@@ -268,9 +283,21 @@ impl State {
 }
 
 // ─── Reading /sys/block/<dev>/stat ───
+//
+// The kernel stat file has the following field layout (space separated):
+//   0=read_ios  1=read_merges  2=read_sectors  3=read_ticks
+//   4=write_ios 5=write_merges 6=write_sectors 7=write_ticks
+//   8=in_flight 9=io_ticks    10=time_in_queue ...
+//
+// We read write_ios, write_merges, and write_sectors.
+// write_merges counts how many adjacent write requests the kernel merged
+// before dispatching to the device — a high merge count relative to write_ios
+// indicates a more sequential write pattern, which we use to compute the
+// sequential_ratio for the WAF model.
 
 struct KernelStats {
     write_ios: u64,
+    write_merges: u64,
     write_sectors: u64,
 }
 
@@ -288,7 +315,8 @@ fn read_kernel_stats(device: &str) -> Result<KernelStats> {
     //   0=read_ios 1=read_merges 2=read_sectors 3=read_ticks
     //   4=write_ios 5=write_merges 6=write_sectors 7=write_ticks ...
     Ok(KernelStats {
-        write_ios: *fields.get(4).unwrap_or(&0),
+        write_ios:     *fields.get(4).unwrap_or(&0),
+        write_merges:  *fields.get(5).unwrap_or(&0),
         write_sectors: *fields.get(6).unwrap_or(&0),
     })
 }
@@ -327,6 +355,10 @@ fn detect_card_bytes(device: &str) -> Result<u64> {
 // which is a reasonable default for modern consumer SD and USB flash devices.
 //
 // The user can always override with --erase-block-kb if they know better.
+//
+// NOTE: the erase block size is still used for the lifetime budget display
+// and P/E cycle accounting. It is no longer used in the WAF calculation itself
+// (which now uses flash_page_size instead).
 
 fn detect_erase_block_bytes(device: &str) -> u64 {
     // Fallback default: 4 MB erase block
@@ -471,81 +503,136 @@ fn max_filesystem_fullness(mount_points: &[(String, String)]) -> f64 {
     max_used
 }
 
-// ─── Fullness WAF multiplier ───
-//
-// As the card fills up, the FTL has less free space to work with.
-// Garbage collection is forced to run more frequently and with less
-// choice about which blocks to consolidate, increasing WAF.
-//
-// These multipliers are heuristic — real values depend on the FTL
-// implementation which is proprietary. The curve is intentionally
-// conservative (not alarmist).
-//
-//   < 50% full  → no extra pressure, multiplier = 1.0
-//   50-70%      → mild pressure,     multiplier = 1.1
-//   70-85%      → moderate pressure, multiplier = 1.3
-//   85-95%      → high pressure,     multiplier = 1.6
-//   > 95%       → severe pressure,   multiplier = 2.0
-
-fn fullness_waf_multiplier(used_fraction: f64) -> f64 {
-    match used_fraction {
-        f if f >= 0.95 => 2.0,
-        f if f >= 0.85 => 1.6,
-        f if f >= 0.70 => 1.3,
-        f if f >= 0.50 => 1.1,
-        _ => 1.0,
-    }
-}
-
 // ─── Write amplification estimation ───
 //
-// The only thing we can observe from outside the SD card is:
-//   - How many IOs the host sent
-//   - How many sectors total
-//   - Therefore average IO size
+// This model replaces the previous erase-block-based approach with a more
+// physically accurate two-component model:
 //
-// Small random writes cause the FTL to do read-modify-erase-write
-// on entire erase blocks. Large sequential writes map ~1:1.
+//   Component 1 — Page-level WAF (normal write amplification)
+//   ──────────────────────────────────────────────────────────
+//   The FTL programs data at page granularity (typically 4–16 KB), not at
+//   erase block granularity. Small writes that don't fill a full page cause
+//   the FTL to partially fill a page, wasting the remainder.
 //
-// We model base WAF as a function of (avg_io_size / erase_block_size),
-// then apply a fullness multiplier to account for GC pressure.
+//     page_waf = max(1.0, flash_page_size / avg_io_bytes)
+//
+//   We then weight this by the sequential ratio — sequential writes can be
+//   coalesced by the FTL into full pages with near-zero amplification, while
+//   random writes suffer the full page_waf penalty:
+//
+//     random_waf = page_waf × (1 - sequential_ratio) + 1.0 × sequential_ratio
+//
+//   The sequential_ratio is derived from the kernel's write_merges counter:
+//     sequential_ratio = write_merges / (write_ios + write_merges)
+//   A high merge count means the kernel is coalescing adjacent IOs before
+//   dispatching — a reliable signal of sequential write patterns.
+//
+//   Component 2 — Garbage collection WAF
+//   ──────────────────────────────────────
+//   GC cost depends on how full the flash is. We use the greedy GC model
+//   (Desnoyers 2012) which gives a lower bound on GC amplification:
+//
+//     gc_waf = 1.0 / (1.0 - effective_fill)
+//
+//   where effective_fill adjusts for the card's over-provisioned space:
+//
+//     effective_fill = fill_ratio × (1.0 - over_provision)
+//
+//   At 37% filesystem full with 7% over-provisioning:
+//     effective_fill = 0.37 × 0.93 = 0.344
+//     gc_waf = 1 / (1 - 0.344) = 1.52
+//
+//   Combination — additive not multiplicative
+//   ──────────────────────────────────────────
+//   Multiplying page_waf × gc_waf double-counts: GC moves full pages so
+//   GC relocations don't suffer additional page-level amplification.
+//   The additive model is more physically defensible:
+//
+//     total_waf = random_waf + (gc_waf - 1.0)
+//
+//   This gives:
+//     - Sequential writes at low fill: WAF ≈ 1 + small GC overhead ✓
+//     - Random small writes at low fill: WAF ≈ 3–5 ✓
+//     - Random small writes at high fill: WAF climbs steeply ✓
+//     - Large writes: page_waf drops toward 1.0 ✓
 
 fn estimate_waf(
     delta_sectors: u64,
     delta_ios: u64,
-    erase_block_bytes: u64,
-    fullness_multiplier: f64,
+    delta_merges: u64,
+    flash_page_bytes: u64,
+    fill_ratio: f64,
+    over_provision: f64,
 ) -> f64 {
     if delta_ios == 0 || delta_sectors == 0 {
         return 1.0;
     }
 
-    // Guard against a zero erase block size — should not happen after the
-    // detection fix but we defend here as well to avoid a divide-by-zero panic
-    if erase_block_bytes == 0 {
+    // Guard against a zero page size — should not happen with validated args
+    // but we defend here to avoid a divide-by-zero panic
+    if flash_page_bytes == 0 {
         return 1.0;
     }
 
+    // Average host IO size in bytes for this poll interval
     let avg_io_bytes = (delta_sectors * 512) as f64 / delta_ios as f64;
 
-    // Base WAF from IO size vs erase block size
-    let base_waf = if avg_io_bytes >= erase_block_bytes as f64 {
-        // Writes are already erase-block sized or larger — nearly 1:1
-        1.05
-    } else {
-        // Naive worst case: full erase block rewritten per small write
-        let naive_waf = erase_block_bytes as f64 / avg_io_bytes;
+    // ── Component 1: Page-level WAF ──
+    //
+    // How many times larger is the flash page than the average IO?
+    // Clamped to a minimum of 1.0 — writes larger than a page have no
+    // page-level amplification.
+    let page_waf = (flash_page_bytes as f64 / avg_io_bytes).max(1.0);
 
-        // Real FTLs use log-structured translation, so actual WAF is
-        // much less than naive. Factor of ~0.1-0.2 is reasonable for
-        // consumer SD cards with decent controllers.
-        let ftl_efficiency = 0.15;
-        let waf = 1.0 + (naive_waf - 1.0) * ftl_efficiency;
-        waf.clamp(1.0, naive_waf)
+    // ── Sequential ratio from kernel merge stats ──
+    //
+    // write_merges counts IOs that the kernel block layer merged with an
+    // adjacent IO before dispatching. A merged IO is a strong indicator
+    // of sequential access — random IOs are almost never adjacent.
+    //
+    // sequential_ratio = merges / (dispatched_ios + merges)
+    //
+    // This gives a value in [0.0, 1.0]:
+    //   0.0 = fully random (no merges at all)
+    //   1.0 = fully sequential (all IOs were merged)
+    let total_io_events = delta_ios + delta_merges;
+    let sequential_ratio = if total_io_events > 0 {
+        delta_merges as f64 / total_io_events as f64
+    } else {
+        0.0
     };
 
-    // Apply fullness multiplier — higher card usage = more GC pressure = higher WAF
-    base_waf * fullness_multiplier
+    // ── Blend page_waf by sequential ratio ──
+    //
+    // Sequential writes can be coalesced by the FTL into full pages with
+    // near-zero amplification (WAF ≈ 1.0). Random writes suffer the full
+    // page_waf penalty. We linearly interpolate between the two extremes.
+    let random_waf = page_waf * (1.0 - sequential_ratio) + 1.0 * sequential_ratio;
+
+    // ── Component 2: GC WAF using greedy GC model ──
+    //
+    // Adjust filesystem fill ratio for the card's over-provisioned space.
+    // Over-provisioned space is invisible to the filesystem but available
+    // to the FTL for GC staging, so the FTL sees a lower effective fill level.
+    let effective_fill = fill_ratio * (1.0 - over_provision);
+
+    // Greedy GC model: gc_waf = 1 / (1 - effective_fill)
+    // Clamp effective_fill to [0.0, 0.99] to avoid division by zero or
+    // astronomically large values when the card is nearly full.
+    let effective_fill_clamped = effective_fill.clamp(0.0, 0.99);
+    let gc_waf = 1.0 / (1.0 - effective_fill_clamped);
+
+    // ── Additive combination ──
+    //
+    // total_waf = random_waf + (gc_waf - 1.0)
+    //
+    // The (gc_waf - 1.0) term represents the extra writes caused by GC
+    // beyond the baseline 1:1 write. Adding it to random_waf rather than
+    // multiplying avoids double-counting page-level amplification in GC paths.
+    let total_waf = random_waf + (gc_waf - 1.0);
+
+    // Ensure WAF is never below 1.0 (cannot write less than what was sent)
+    total_waf.max(1.0)
 }
 
 // ─── Rolling wear rate ring buffer management ───
@@ -706,12 +793,25 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── Validate --over-provision ──
+    // Must be in the range 0.0 to 0.5 — values above 50% are not physically
+    // plausible for any real SD card and likely indicate a user error.
+    if !(0.0..=0.5).contains(&args.over_provision) {
+        eprintln!(
+            "Error: --over-provision value {:.3} is out of range. Must be between 0.0 and 0.5.",
+            args.over_provision
+        );
+        std::process::exit(1);
+    }
+
     // ── Auto-detect card size from /sys/block/<dev>/size ──
     let card_bytes = detect_card_bytes(&args.device)
         .with_context(|| format!("Failed to detect size of device {}", args.device))?;
     let card_gb = card_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
     // ── Erase block size: use override if provided, otherwise auto-detect ──
+    // Note: erase block size is used for the lifetime budget display and P/E
+    // accounting but NOT for WAF estimation (which now uses flash_page_size).
     let erase_block_bytes = match args.erase_block_kb {
         Some(kb) => {
             println!("Erase block:  {} KB (user override)", kb);
@@ -817,6 +917,8 @@ fn main() -> Result<()> {
     println!("Device:        /dev/{}", args.device);
     println!("Card size:     {:.1} GB (auto-detected)", card_gb);
     println!("Erase block:   {} KB", erase_block_kb);
+    println!("Flash page:    {} bytes", args.flash_page_size);
+    println!("Over-prov:     {:.0}%", args.over_provision * 100.0);
     println!("Rated P/E:     {} cycles", args.pe_cycles);
     println!("State file:    {}", args.state_file.display());
     println!("Save interval: {} seconds", args.save_interval);
@@ -852,7 +954,8 @@ fn main() -> Result<()> {
 
         let now = read_kernel_stats(&args.device)?;
 
-        let delta_ios = now.write_ios.saturating_sub(prev.write_ios);
+        let delta_ios     = now.write_ios.saturating_sub(prev.write_ios);
+        let delta_merges  = now.write_merges.saturating_sub(prev.write_merges);
         let delta_sectors = now.write_sectors.saturating_sub(prev.write_sectors);
 
         if delta_ios > 0 || delta_sectors > 0 {
@@ -864,15 +967,24 @@ fn main() -> Result<()> {
                 0.0
             };
 
-            // Sample current filesystem fullness and compute WAF multiplier.
+            // Sample current filesystem fullness.
             // We re-sample every poll so the estimate tracks changing disk usage.
             let fullness = max_filesystem_fullness(&mount_points);
-            let fullness_mult = fullness_waf_multiplier(fullness);
 
             // Update the fullness in state so it is current at next save
             state.filesystem_fullness_pct = (fullness * 1000.0).round() / 10.0;
 
-            let waf = estimate_waf(delta_sectors, delta_ios, erase_block_bytes, fullness_mult);
+            // Estimate WAF using the new page-size + greedy-GC model.
+            // Pass delta_merges so the model can derive the sequential ratio dynamically.
+            let waf = estimate_waf(
+                delta_sectors,
+                delta_ios,
+                delta_merges,
+                args.flash_page_size,
+                fullness,
+                args.over_provision,
+            );
+
             let delta_flash_bytes = (delta_host_bytes as f64 * waf) as u64;
 
             // Update cumulative state

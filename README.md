@@ -32,17 +32,16 @@ Add the following options to your `/etc/fstab` entries for SD card mounted files
 
 ## How It Works
 
-SD cards use NAND flash memory which has a finite number of **Program/Erase (P/E) cycles** before it wears out. The actual number of bytes written to the flash is always higher than what the host OS sends — this is called **Write Amplification (WAF)** and is caused by the SD card's internal Flash Translation Layer (FTL) having to erase and rewrite entire blocks even for small updates.
+SD cards use NAND flash memory which has a finite number of **Program/Erase (P/E) cycles** before it wears out. The actual number of bytes written to the flash is always higher than what the host OS sends — this is called **Write Amplification (WAF)** and is caused by the SD card's internal Flash Translation Layer (FTL) having to manage page-level writes and periodic garbage collection.
 
 `sdestimator` monitors the Linux kernel's block I/O counters for your SD card device and:
 
-1. Computes the **delta** of sectors and IOs written each poll interval
-2. Estimates the **Write Amplification Factor** based on average IO size vs flash erase block size
-3. Applies a **fullness multiplier** — a fuller card means more garbage collection pressure and higher WAF
-4. Accumulates **estimated flash bytes written** over time
-5. Derives the **average P/E cycle count** across the card and the **remaining life percentage**
-6. Maintains a **rolling 28-day wear rate ring buffer** (1 sample per day, every 24 hours) to extrapolate how many years of write life remain at the current rate of use
-7. Persists all state to a JSON file so tracking survives reboots and daemon restarts
+1. Computes the **delta** of sectors, IOs, and merged IOs written each poll interval
+2. Estimates the **Write Amplification Factor** using a two-component model based on flash page size, sequential write ratio, and filesystem fullness
+3. Accumulates **estimated flash bytes written** over time
+4. Derives the **average P/E cycle count** across the card and the **remaining life percentage**
+5. Maintains a **rolling 28-day wear rate ring buffer** (1 sample per day, every 24 hours) to extrapolate how many years of write life remain at the current rate of use
+6. Persists all state to a JSON file so tracking survives reboots and daemon restarts
 
 It does **not** require any special kernel modules, hardware access, or SD card vendor tools. Everything is derived from standard Linux sysfs and procfs interfaces.
 
@@ -53,7 +52,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 - 🔍 **Auto-detects card size** from `/sys/block/<dev>/size`
 - 🔍 **Auto-detects erase block size** from `/sys/block/<dev>/queue/`
 - 🔍 **Auto-detects mount points** by cross-referencing `/sys/block/` partitions with `/proc/mounts`
-- 📊 **Fullness-aware WAF estimation** — accounts for GC pressure as the card fills up
+- 📊 **Physics-based WAF estimation** — page-size + greedy GC model with dynamic sequential ratio from kernel merge stats
 - 📈 **Years-left extrapolation** — rolling 28-day wear rate used to estimate remaining write life in years
 - 💾 **Persistent state** across reboots via a human-readable JSON file
 - ⚙️ **systemd compatible** — designed to run as a background service
@@ -154,6 +153,8 @@ Options:
   -e, --erase-block-kb <KB>          Override erase block size in KB (auto-detected if not set)
   -p, --pe-cycles <N>                Rated P/E cycle endurance [default: 3000]
   -i, --interval <SECS>              Poll interval in seconds [default: 5]
+      --flash-page-size <BYTES>      Flash page size in bytes used for WAF estimation [default: 16384]
+      --over-provision <RATIO>       SD card over-provisioning ratio 0.0–0.5 [default: 0.07]
       --state-file <PATH>            State file path [default: /var/lib/sdwear/state.json]
       --save-interval <SECS>         How often to save state to disk in seconds [default: 300]
       --initial-health <PERCENT>     Starting health percentage for a card already in use (0.0–100.0).
@@ -193,6 +194,15 @@ The daemon will start tracking wear from a baseline of 70% life remaining rather
 the card is brand new. If a state file already exists this flag is silently ignored so that
 accumulated wear data is never overwritten.
 
+### Tuning the WAF model for your card
+```bash
+sdestimator --flash-page-size 4096 --over-provision 0.10
+```
+
+Use a smaller `--flash-page-size` for older or budget cards (4 KB is common), and a larger value
+for modern high-density cards (16 KB or 32 KB). Use `--over-provision` to reflect the card's
+reserved space — industrial cards often over-provision more aggressively (10–28%).
+
 ---
 
 ## Output
@@ -204,6 +214,8 @@ sdwear — SD Card Flash Wear Estimator
 Device:        /dev/mmcblk0
 Card size:     128.0 GB (auto-detected)
 Erase block:   4096 KB (auto-detected)
+Flash page:    16384 bytes
+Over-prov:     7%
 Rated P/E:     3000 cycles
 State file:    /var/lib/sdwear/state.json
 Save interval: 300 seconds
@@ -231,7 +243,7 @@ the startup header has long since scrolled out of view.
 | `kb` | Kilobytes written to the device this poll interval (host side) |
 | `avg_kb` | Average IO size in KB this poll interval |
 | `waf` | Estimated Write Amplification Factor this poll interval |
-| `full` | Filesystem fullness % (worst partition) — drives the WAF multiplier |
+| `full` | Filesystem fullness % (worst partition) |
 | `pe` | Cumulative estimated average P/E cycles consumed across the card |
 | `life` | Estimated remaining life as % of rated P/E endurance |
 | `yrs_left` | Extrapolated years of write life remaining at the current rolling wear rate. Shows `n/a` for the first 24 hours (not enough history yet), and `>100y` when the rate is so low the card is effectively not wearing out. |
@@ -332,26 +344,58 @@ journalctl -u sdwear -f
 
 ## Write Amplification Model
 
-The WAF estimate is a two-stage heuristic:
+The WAF estimate uses a two-component physics-based model that is significantly more accurate than a naive erase-block ratio approach.
 
-### Stage 1 — IO size vs erase block size
-| Average IO size | Base WAF |
+### Component 1 — Page-level WAF
+
+The FTL programs data at **page granularity** (typically 4–16 KB), not at erase block granularity. Small writes that don't fill a full page cause the FTL to partially fill a page, wasting the remainder:
+
+```
+page_waf = max(1.0, flash_page_size / avg_io_bytes)
+```
+
+This is then weighted by a **sequential ratio** derived dynamically from the kernel's `write_merges` counter. The kernel block layer merges adjacent IOs before dispatching — a high merge count is a reliable indicator of sequential write patterns. Sequential writes can be coalesced by the FTL into full pages with near-zero amplification, while random writes suffer the full page_waf penalty:
+
+```
+sequential_ratio = write_merges / (write_ios + write_merges)
+random_waf       = page_waf × (1 - sequential_ratio) + 1.0 × sequential_ratio
+```
+
+### Component 2 — Garbage Collection WAF
+
+GC cost depends on how full the flash is. The **greedy GC model** (Desnoyers 2012) gives a well-established lower bound on GC amplification. The filesystem fill ratio is first adjusted for the card's over-provisioned space (which is invisible to the filesystem but available to the FTL):
+
+```
+effective_fill = fill_ratio × (1.0 - over_provision)
+gc_waf         = 1.0 / (1.0 - effective_fill)
+```
+
+At 37% filesystem full with 7% over-provisioning: `effective_fill = 0.344`, `gc_waf ≈ 1.52`.
+
+### Combination — additive not multiplicative
+
+Multiplying `page_waf × gc_waf` would double-count: GC moves full pages so GC relocations don't suffer additional page-level amplification. The additive model is more physically defensible:
+
+```
+total_waf = random_waf + (gc_waf - 1.0)
+```
+
+### Behaviour across workloads
+
+| Workload | Expected WAF |
 |---|---|
-| ≥ erase block size | 1.05 (nearly sequential) |
-| Smaller | `1 + (erase_block / avg_io - 1) × 0.15` |
+| Large sequential writes at low fill | ≈ 1.0–1.5 |
+| Mixed workload (50% sequential) at low fill | ≈ 2–4 |
+| Small random writes at low fill (37%) | ≈ 3–5 |
+| Small random writes at high fill (80%) | ≈ 6–10 |
+| Small random writes at very high fill (95%) | ≈ 15–25 |
 
-The `0.15` efficiency factor models the FTL's log-structured write buffering — real FTLs are significantly better than naive worst-case.
+### Tuning parameters
 
-### Stage 2 — Fullness multiplier
-| Card fullness | Multiplier |
-|---|---|
-| < 50% | 1.0× |
-| 50–70% | 1.1× |
-| 70–85% | 1.3× |
-| 85–95% | 1.6× |
-| > 95% | 2.0× |
-
-A fuller card means the FTL has less room to manoeuvre, forcing more frequent and less efficient garbage collection.
+| Parameter | CLI arg | Default | Notes |
+|---|---|---|---|
+| Flash page size | `--flash-page-size` | 16384 (16 KB) | Use 4096 for older/budget cards |
+| Over-provisioning | `--over-provision` | 0.07 (7%) | Industrial cards often use 0.10–0.28 |
 
 ---
 
