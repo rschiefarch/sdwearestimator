@@ -283,6 +283,6 @@ When in doubt, use `--pe-cycles 1000` for a conservative estimate on a typical c
 
 ## License
 
-unlicense - see https://unlicense.org>
+unlicense - see https://unlicense.org
 
 ---
