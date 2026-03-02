@@ -4,6 +4,7 @@
 // altered by Poindexter AI: added human-readable descriptor fields to persisted state JSON
 // altered by Poindexter AI: fix erase block zero bug; add LUKS/dm-crypt mount detection via /sys/block/<dev>/holders
 // altered by Poindexter AI: add #[serde(default)] to all State fields for backwards compatibility with older state files
+// altered by Poindexter AI: added --initial-health argument to preset starting life % for a card already in use
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,6 +42,13 @@ struct Args {
     /// How often to save state to disk in seconds (default: 300 = 5 minutes)
     #[arg(long, default_value_t = 300)]
     save_interval: u64,
+
+    /// Preset the starting health percentage for a card you have already been using
+    /// (0.0 – 100.0). Only applied when no existing state file is found; ignored
+    /// if a state file already exists so accumulated wear data is never overwritten.
+    /// Defaults to 100.0 (brand new card) if not specified.
+    #[arg(long)]
+    initial_health: Option<f64>,
 }
 
 // ─── Serde default helpers ───
@@ -55,6 +63,12 @@ struct Args {
 
 /// Default life remaining is 100% (brand new card, no wear recorded)
 fn default_life_remaining() -> f64 {
+    100.0
+}
+
+/// Default initial health is 100% — used when reading an older state file that
+/// predates the initial_health_pct field, meaning monitoring started on a fresh card.
+fn default_initial_health() -> f64 {
     100.0
 }
 
@@ -138,6 +152,13 @@ struct State {
     #[serde(default = "default_life_remaining")]
     estimated_life_remaining_pct: f64,
 
+    /// The health percentage that monitoring started at for this card.
+    /// Set to the --initial-health argument value when first creating the state file,
+    /// or 100.0 if monitoring started on a brand new card (or the field is absent
+    /// in an older state file). Stored purely for reference — not used in calculations.
+    #[serde(default = "default_initial_health")]
+    initial_health_pct: f64,
+
     // ── Section 3: Internal algorithm counters ──
 
     /// Raw kernel write sector counter at last poll — used to compute deltas
@@ -183,6 +204,9 @@ impl State {
             estimated_flash_bytes_written: 0,
             estimated_avg_pe_cycles: 0.0,
             estimated_life_remaining_pct: 100.0,
+
+            // Initial health defaults to 100% (brand new card)
+            initial_health_pct: 100.0,
 
             // Internal counters
             last_kernel_write_sectors: 0,
@@ -506,6 +530,19 @@ fn now_string() -> String {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // ── Validate --initial-health if provided ──
+    // Must be in the range 0.0 to 100.0 inclusive. We check this early so the
+    // user gets a clear error message before any detection or state loading occurs.
+    if let Some(ih) = args.initial_health {
+        if !(0.0..=100.0).contains(&ih) {
+            eprintln!(
+                "Error: --initial-health value {:.2} is out of range. Must be between 0.0 and 100.0.",
+                ih
+            );
+            std::process::exit(1);
+        }
+    }
+
     // ── Auto-detect card size from /sys/block/<dev>/size ──
     let card_bytes = detect_card_bytes(&args.device)
         .with_context(|| format!("Failed to detect size of device {}", args.device))?;
@@ -538,7 +575,54 @@ fn main() -> Result<()> {
     // The save interval as a Duration for time-based comparison
     let save_interval = Duration::from_secs(args.save_interval);
 
+    // ── Determine whether a state file already exists before loading ──
+    // We need to know this so we can decide whether to apply --initial-health.
+    // load_state() silently falls back to State::new() if the file is absent or
+    // unparseable, so we check existence explicitly here.
+    let state_file_existed = args.state_file.exists();
+
     let mut state = load_state(&args.state_file);
+
+    // ── Apply --initial-health only when starting fresh (no prior state file) ──
+    //
+    // If the user supplied --initial-health and there was no existing state file,
+    // we initialise the life remaining and avg P/E cycle fields to reflect the
+    // requested starting health rather than the default 100%.
+    //
+    // The avg P/E cycles value is back-calculated from the requested life %:
+    //   life_remaining = (1 - avg_pe / pe_rated) * 100
+    //   => avg_pe = (1 - life_remaining/100) * pe_rated
+    //
+    // If a state file already existed we leave everything untouched — the
+    // persisted wear data is the ground truth and must not be overwritten.
+    if let Some(initial_health) = args.initial_health {
+        if !state_file_existed {
+            // Back-calculate the implied avg P/E cycles from the requested health %
+            let implied_avg_pe = (1.0 - initial_health / 100.0) * args.pe_cycles as f64;
+
+            state.estimated_life_remaining_pct = initial_health;
+            state.estimated_avg_pe_cycles = implied_avg_pe;
+            state.initial_health_pct = initial_health;
+
+            // Back-calculate implied estimated_flash_bytes_written so that subsequent
+            // wear accumulation is consistent with the starting point.
+            // formula: avg_pe = flash_bytes_written / card_bytes
+            //          => flash_bytes_written = avg_pe * card_bytes
+            state.estimated_flash_bytes_written =
+                (implied_avg_pe * card_bytes as f64) as u64;
+
+            println!(
+                "Initial health preset to {:.1}% (--initial-health applied to new state file)",
+                initial_health
+            );
+        } else {
+            // State file already exists — silently ignore --initial-health
+            println!(
+                "Note: --initial-health ignored because an existing state file was found at {}",
+                args.state_file.display()
+            );
+        }
+    }
 
     // ── Refresh descriptor fields on every startup ──
     // These are always re-detected from the system so the JSON stays accurate

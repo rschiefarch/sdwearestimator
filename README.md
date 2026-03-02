@@ -117,6 +117,9 @@ Options:
   -i, --interval <SECS>              Poll interval in seconds [default: 5]
       --state-file <PATH>            State file path [default: /var/lib/sdwear/state.json]
       --save-interval <SECS>         How often to save state to disk in seconds [default: 300]
+      --initial-health <PERCENT>     Starting health percentage for a card already in use (0.0–100.0).
+                                     Only applied when no existing state file is found; ignored if a
+                                     state file already exists. Defaults to 100.0 (brand new card).
   -h, --help                         Print help
   -V, --version                      Print version
 ```
@@ -140,6 +143,16 @@ sdestimator --save-interval 60
 ```bash
 sdestimator --device mmcblk1
 ```
+
+### Card already in use — preset starting health at 70%
+```bash
+sdestimator --initial-health 70
+```
+
+This is useful when you begin monitoring a card that has already been in service for some time.
+The daemon will start tracking wear from a baseline of 70% life remaining rather than assuming
+the card is brand new. If a state file already exists this flag is silently ignored so that
+accumulated wear data is never overwritten.
 
 ---
 
@@ -190,6 +203,7 @@ State is persisted to a human-readable JSON file (default `/var/lib/sdwear/state
   "estimated_flash_bytes_written": 987654321,
   "estimated_avg_pe_cycles": 0.000123,
   "estimated_life_remaining_pct": 99.9877,
+  "initial_health_pct": 100.0,
   "last_kernel_write_sectors": 1234567,
   "last_kernel_write_ios": 98765,
   "first_started": "1709123456",
@@ -204,6 +218,7 @@ The key fields for card health are:
 |---|---|
 | `estimated_avg_pe_cycles` | Average P/E cycles consumed per erase block across the whole card |
 | `estimated_life_remaining_pct` | Estimated remaining life as % of rated endurance |
+| `initial_health_pct` | Health % that monitoring started at (100.0 = brand new; lower if `--initial-health` was used) |
 | `filesystem_fullness_pct` | How full the card was at last save — affects WAF |
 | `reboot_count` | Number of reboots detected since monitoring began |
 
