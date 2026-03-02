@@ -20,12 +20,12 @@ Add the following options to your `/etc/fstab` entries for SD card mounted files
 /dev/xxx  /mnt/yyy  ext4  defaults,noatime,nodiratime,commit=600,lazytime  0  2
 ```
 
-| Option | Effect |
-|---|---|
-| `noatime` | Disables updating of file access timestamps on every read |
-| `nodiratime` | Disables updating of directory access timestamps on every read |
-| `commit=600` | Batches and caches write-through to disk every 10 minutes rather than the default 1 minute |
-| `lazytime` | Delays flushing of time metadata (atime, mtime, ctime) to disk until the file is actually modified |
+| Option | Effect                                                                                                                                                                              |
+|---|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `noatime` | Disables updating of file access timestamps on every read                                                                                                                           |
+| `nodiratime` | Disables updating of directory access timestamps on every read                                                                                                                      |
+| `commit=600` | (optional if you can handle more data loss from power outage - good if raspi on battery) Batches and caches write-through to disk every 10 minutes rather than the default 1 minute |
+| `lazytime` | Delays flushing of time metadata (atime, mtime, ctime) to disk until the file is actually modified                                                                                  |
 
 
 ---
