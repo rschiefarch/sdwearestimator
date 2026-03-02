@@ -61,9 +61,9 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 
 ## Installation
 
-### Pre-built Binary (Raspberry Pi 4)
+### ~~Pre-built Binary (Raspberry Pi 4) - too rtisky just build from source~~
 
-Download the latest release binary for `aarch64` from the [Releases](../../releases) page and copy it to your Pi:
+~~Download the latest release binary for `aarch64` from the [Releases](../../releases) page and copy it to your Pi:~~
 
 ```bash
 scp sdestimator pi@<pi-ip>:/usr/local/bin/
