@@ -61,7 +61,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 
 ---
 
-## Choosing a P/E Cycle Endurance Value for consumer series Sandisk SD Cards
+## Choosing a P/E Cycle Endurance Value for Brands / Series of SD Cards
 
 > **Note:** The wear reduction tips at the top of this document can make a massive difference to the actual rate of wear observed in practice — a well-configured system may extends the life of the card by multiples compared to the default settings.
 
