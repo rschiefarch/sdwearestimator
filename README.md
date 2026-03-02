@@ -72,7 +72,9 @@ For context: a 32GB card enduring 3,142 cycles equates to writing ~100TB of data
 
 From these tests, **2000** could be considered a conservative estimate for `--pe-cycles` when using SanDisk Ultra series cards.
 
-See the full test results here for other brands/series to get a pe-cycles endurance number: [The Great MicroSD Card Survey — Two Years Later](https://www.bahjeez.com/the-great-microsd-card-survey-two-years-later/)
+See the full test results here for other brands/series to get a pe-cycles endurance number:
+
+[The Great MicroSD Card Survey — Two Years Later](https://www.bahjeez.com/the-great-microsd-card-survey-two-years-later/)
 
 ---
 
