@@ -7,7 +7,12 @@
   }, {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
+    "path" : "/Cargo.toml",
+    "desc" : "Removed unused dependencies (tokio, chrono, time), added nix with fs feature"
+  }, {
+    "dexUnit" : "sdestimator",
+    "workSpec" : "none",
     "path" : "/README.md",
-    "desc" : "Updated all references from 6-hour/7-day ring buffer to 24-hour/28-day ring buffer"
+    "desc" : "Added musl static build instructions and noted ~668 KB RSS footprint on Raspberry Pi 4"
   } ]
 }

@@ -58,6 +58,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 - 💾 **Persistent state** across reboots via a human-readable JSON file
 - ⚙️ **systemd compatible** — designed to run as a background service
 - 🦀 **Single binary**, no runtime dependencies
+- 🪶 **Tiny resident footprint** — musl static build runs at ~668 KB RSS on Raspberry Pi 4
 
 ---
 
@@ -98,22 +99,41 @@ You will need the [Rust toolchain](https://rustup.rs/) installed.
 cargo build --release
 ```
 
-#### Cross-compile for Raspberry Pi 4 (aarch64) from Linux x86_64
-
-Add the target and cross-linker:
+#### Cross-compile for Raspberry Pi 4 (aarch64) — glibc build
 ```bash
 rustup target add aarch64-unknown-linux-gnu
 sudo apt install gcc-aarch64-linux-gnu
-```
-
-Build:
-```bash
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
 The binary will be at:
 ```
 target/aarch64-unknown-linux-gnu/release/sdestimator
+```
+
+#### Cross-compile for Raspberry Pi 4 (aarch64) — musl static build ✅ recommended
+
+The musl build statically links the C runtime, eliminating the glibc runtime overhead entirely.
+This results in a significantly smaller resident memory footprint (~668 KB RSS observed on Raspberry Pi 4
+vs ~3 MB for a typical glibc-linked build). It also produces a fully self-contained binary with no
+shared library dependencies, making deployment simpler.
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+```
+
+> **Note:** Unlike the glibc cross-compile, no external cross-linker package is required — the Rust
+> toolchain handles everything via its bundled musl linker for this target.
+
+The binary will be at:
+```
+target/aarch64-unknown-linux-musl/release/sdestimator
+```
+
+Copy to the Pi:
+```bash
+scp target/aarch64-unknown-linux-musl/release/sdestimator pi@<pi-ip>:/usr/local/bin/
 ```
 
 #### Using `cross` (easiest, requires Docker)
