@@ -61,6 +61,21 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 
 ---
 
+## Choosing a P/E Cycle Endurance Value for consumer series Sandisk SD Cards
+
+> **Note:** The wear reduction tips at the top of this document can make a massive difference to the actual rate of wear observed in practice — a well-configured system may extends the life of the card by multiples of the default filesystem settings.
+
+A large-scale microSD endurance survey tested 3 SanDisk Ultra 32GB cards until failure.
+All three failed after an average of 3,142 read/write cycles.
+One card failed as early as 2,747 cycles, showing inconsistency even within the same batch.
+For context: a 32GB card enduring 3,142 cycles equates to writing ~100TB of data before failure.
+
+From these tests, **2000** could be considered a conservative estimate for `--pe-cycles` when using SanDisk Ultra series cards.
+
+See the full test results here: [The Great MicroSD Card Survey — Two Years Later](https://www.bahjeez.com/the-great-microsd-card-survey-two-years-later/)
+
+---
+
 ## Installation
 
 ### ~~Pre-built Binary (Raspberry Pi 4) - don't download a binary just build from source~~
