@@ -61,7 +61,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 
 ## Installation
 
-### ~~Pre-built Binary (Raspberry Pi 4) - too rtisky just build from source~~
+### ~~Pre-built Binary (Raspberry Pi 4) - don't download a binary just build from source~~
 
 ~~Download the latest release binary for `aarch64` from the [Releases](../../releases) page and copy it to your Pi:~~
 
