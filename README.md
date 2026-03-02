@@ -4,16 +4,30 @@ A lightweight Linux daemon written in Rust that estimates flash wear on SD cards
 
 Designed primarily for always-on embedded Linux systems such as the **Raspberry Pi**, where SD card longevity is a common concern.
 
-To minimise sd card wear on Raspberry pi and sbcs that mount root on an sd card - consider the use of:
-log2ram
-tmpfs
+## Tips to Minimise SD Card Wear
 
-extra fstab params:
+For Raspberry Pi and other SBCs that mount root on an SD card, consider the following:
+
+### Tools
+- **log2ram** — mounts `/var/log` in RAM and only flushes to disk periodically, dramatically reducing log write wear
+- **tmpfs** — mount frequently written directories (e.g. `/tmp`, `/var/tmp`) in RAM so they never touch the SD card
+
+### fstab Mount Options
+
+Add the following options to your `/etc/fstab` entries for SD card mounted filesystems:
+
+```
 /dev/xxx  /mnt/yyy  ext4  defaults,noatime,nodiratime,commit=600,lazytime  0  2
-noatime doesnt update access time for files
-nodiractime doesnt update accesstime for dirs
-commit caches and batches writethrough for 10 minute rather than 1 minute
-lazytime 
+```
+
+| Option | Effect |
+|---|---|
+| `noatime` | Disables updating of file access timestamps on every read |
+| `nodiratime` | Disables updating of directory access timestamps on every read |
+| `commit=600` | Batches and caches write-through to disk every 10 minutes rather than the default 1 minute |
+| `lazytime` | Delays flushing of time metadata (atime, mtime, ctime) to disk until the file is actually modified |
+
+
 ---
 
 ## How It Works
