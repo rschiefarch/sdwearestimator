@@ -3,11 +3,11 @@
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
     "path" : "/src/main.rs",
-    "desc" : "reduced wear sample ring buffer to 28 entries at 6-hour intervals (7 days)"
+    "desc" : "Changed ring buffer sample interval from 6 hours (21600s) to 24 hours (86400s) so 28 entries cover 28 days instead of 7"
   }, {
     "dexUnit" : "sdestimator",
     "workSpec" : "none",
     "path" : "/README.md",
-    "desc" : "updated to reflect key=value output format, yrs_left field, and wear sample ring buffer"
+    "desc" : "Updated all references from 6-hour/7-day ring buffer to 24-hour/28-day ring buffer"
   } ]
 }

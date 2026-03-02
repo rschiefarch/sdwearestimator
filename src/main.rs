@@ -7,6 +7,7 @@
 // altered by Poindexter AI: added --initial-health argument to preset starting life % for a card already in use
 // altered by Poindexter AI: added 30-day rolling wear rate ring buffer and yrs_left extrapolation; switched to key=value output format
 // altered by Poindexter AI: reduced wear sample ring buffer to 28 entries at 6-hour intervals (7 days, ~1.8 KB max)
+// altered by Poindexter AI: changed ring buffer sample interval from 6 hours (21600s) to 24 hours (86400s) so 28 entries cover 28 days instead of 7
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -78,19 +79,19 @@ fn default_initial_health() -> f64 {
 //
 // Each sample records a unix timestamp (seconds) and the cumulative estimated
 // flash bytes written at that point in time. Samples are pushed once every
-// 6 hours (21600 seconds). The ring buffer holds at most WEAR_SAMPLE_MAX
-// entries (28 = 7 days × 4 samples per day).
+// 24 hours (86400 seconds). The ring buffer holds at most WEAR_SAMPLE_MAX
+// entries (28 = 28 days × 1 sample per day).
 //
 // To estimate the wear rate we look at the oldest sample in the buffer and
 // compute bytes-per-second over the window it spans, then extrapolate to years.
 
 /// Maximum number of wear samples retained in the ring buffer.
-/// 4 samples/day × 7 days = 28 entries. At ~65 bytes per entry in pretty-printed
+/// 1 sample/day × 28 days = 28 entries. At ~65 bytes per entry in pretty-printed
 /// JSON this keeps the state file contribution from the buffer to ~1.8 KB max.
-const WEAR_SAMPLE_MAX: usize = 28; // 7 days × 4 samples per day
+const WEAR_SAMPLE_MAX: usize = 28; // 28 days × 1 sample per day
 
-/// Minimum seconds between wear samples (6 hours)
-const WEAR_SAMPLE_INTERVAL_SECS: u64 = 21600;
+/// Minimum seconds between wear samples (24 hours)
+const WEAR_SAMPLE_INTERVAL_SECS: u64 = 86400;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct WearSample {
@@ -111,7 +112,7 @@ struct WearSample {
 //   1. Descriptor fields  — what device/card this file relates to
 //   2. Cumulative metrics — the wear tracking numbers
 //   3. Internal counters  — used by the algorithm for delta/reboot detection
-//   4. Rolling wear rate ring buffer — 6-hourly snapshots for yrs_left estimation
+//   4. Rolling wear rate ring buffer — 24-hourly snapshots for yrs_left estimation
 //
 // Every field carries #[serde(default)] so that if a field is absent in an
 // older state file (e.g. from a previous version of the binary that didn't
@@ -213,12 +214,12 @@ struct State {
 
     // ── Section 4: Rolling wear rate ring buffer ──
     //
-    // Snapshots of (timestamp, cumulative_flash_bytes_written) taken every 6 hours.
-    // Capped at WEAR_SAMPLE_MAX (28) entries = 7 days of history.
+    // Snapshots of (timestamp, cumulative_flash_bytes_written) taken every 24 hours.
+    // Capped at WEAR_SAMPLE_MAX (28) entries = 28 days of history.
     // Used to compute a rolling wear rate for the yrs_left extrapolation.
     // Older entries are evicted from the front when the buffer is full.
 
-    /// 6-hourly wear samples for rolling rate calculation (max 28 = 7 days)
+    /// 24-hourly wear samples for rolling rate calculation (max 28 = 28 days)
     #[serde(default)]
     wear_samples: Vec<WearSample>,
 
@@ -549,9 +550,9 @@ fn estimate_waf(
 
 // ─── Rolling wear rate ring buffer management ───
 //
-// We push one sample every WEAR_SAMPLE_INTERVAL_SECS (6 hours) into the ring
+// We push one sample every WEAR_SAMPLE_INTERVAL_SECS (24 hours) into the ring
 // buffer. When the buffer reaches WEAR_SAMPLE_MAX (28) entries the oldest entry
-// is evicted from the front, keeping a rolling 7-day window.
+// is evicted from the front, keeping a rolling 28-day window.
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -560,9 +561,9 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Push a new wear sample if at least WEAR_SAMPLE_INTERVAL_SECS (6 hours) have
+/// Push a new wear sample if at least WEAR_SAMPLE_INTERVAL_SECS (24 hours) have
 /// elapsed since the last sample. Evicts the oldest entry when the buffer is
-/// full (28 entries = 7 days at 4 samples/day).
+/// full (28 entries = 28 days at 1 sample/day).
 fn maybe_push_wear_sample(state: &mut State) {
     let now = now_secs();
 
@@ -592,7 +593,7 @@ fn maybe_push_wear_sample(state: &mut State) {
 //
 // Algorithm:
 //   1. Take the oldest sample in the ring buffer as the start of the window
-//      (up to 7 days ago).
+//      (up to 28 days ago).
 //   2. Compute bytes written and time elapsed over that window.
 //   3. Derive a wear rate in bytes/second.
 //   4. Compute remaining flash bytes capacity:
@@ -601,7 +602,7 @@ fn maybe_push_wear_sample(state: &mut State) {
 //
 // Returns None if:
 //   - The ring buffer has fewer than 2 samples (not enough data yet — need at
-//     least 6 hours of history before the first estimate is produced)
+//     least 24 hours of history before the first estimate is produced)
 //   - The time window is zero (shouldn't happen but guard anyway)
 //   - The wear rate is zero (no writes have occurred in the window)
 //
@@ -614,7 +615,7 @@ fn estimate_years_left(state: &State, card_bytes: u64, pe_cycles: u64) -> Option
         return None;
     }
 
-    // The oldest sample defines the start of the rolling window (up to 7 days ago)
+    // The oldest sample defines the start of the rolling window (up to 28 days ago)
     let oldest = &state.wear_samples[0];
     let now_ts = now_secs();
 
@@ -653,7 +654,7 @@ fn estimate_years_left(state: &State, card_bytes: u64, pe_cycles: u64) -> Option
 }
 
 /// Format the years-left value for display in the output line.
-/// - None            → "n/a"   (not enough data yet — less than 6 hours of history)
+/// - None            → "n/a"   (not enough data yet — less than 24 hours of history)
 /// - Some(100.0)     → ">100y" (capped — effectively infinite at current rate)
 /// - Some(x)         → "4.5y"  (one decimal place)
 fn format_years_left(years: Option<f64>) -> String {
@@ -890,9 +891,9 @@ fn main() -> Result<()> {
                 ((1.0 - (state.estimated_avg_pe_cycles / args.pe_cycles as f64)) * 100.0)
                     .clamp(0.0, 100.0);
 
-            // ── Push 6-hourly wear sample into the rolling ring buffer ──
+            // ── Push 24-hourly wear sample into the rolling ring buffer ──
             // Called on every write-active poll tick but internally only records
-            // a sample once every 6 hours (WEAR_SAMPLE_INTERVAL_SECS).
+            // a sample once every 24 hours (WEAR_SAMPLE_INTERVAL_SECS).
             maybe_push_wear_sample(&mut state);
 
             // ── Compute years-left extrapolation from rolling wear rate ──

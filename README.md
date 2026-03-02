@@ -41,7 +41,7 @@ SD cards use NAND flash memory which has a finite number of **Program/Erase (P/E
 3. Applies a **fullness multiplier** — a fuller card means more garbage collection pressure and higher WAF
 4. Accumulates **estimated flash bytes written** over time
 5. Derives the **average P/E cycle count** across the card and the **remaining life percentage**
-6. Maintains a **rolling 7-day wear rate ring buffer** (4 samples per day, every 6 hours) to extrapolate how many years of write life remain at the current rate of use
+6. Maintains a **rolling 28-day wear rate ring buffer** (1 sample per day, every 24 hours) to extrapolate how many years of write life remain at the current rate of use
 7. Persists all state to a JSON file so tracking survives reboots and daemon restarts
 
 It does **not** require any special kernel modules, hardware access, or SD card vendor tools. Everything is derived from standard Linux sysfs and procfs interfaces.
@@ -54,7 +54,7 @@ It does **not** require any special kernel modules, hardware access, or SD card 
 - 🔍 **Auto-detects erase block size** from `/sys/block/<dev>/queue/`
 - 🔍 **Auto-detects mount points** by cross-referencing `/sys/block/` partitions with `/proc/mounts`
 - 📊 **Fullness-aware WAF estimation** — accounts for GC pressure as the card fills up
-- 📈 **Years-left extrapolation** — rolling 7-day wear rate used to estimate remaining write life in years
+- 📈 **Years-left extrapolation** — rolling 28-day wear rate used to estimate remaining write life in years
 - 💾 **Persistent state** across reboots via a human-readable JSON file
 - ⚙️ **systemd compatible** — designed to run as a background service
 - 🦀 **Single binary**, no runtime dependencies
@@ -197,7 +197,7 @@ the startup header has long since scrolled out of view.
 | `full` | Filesystem fullness % (worst partition) — drives the WAF multiplier |
 | `pe` | Cumulative estimated average P/E cycles consumed across the card |
 | `life` | Estimated remaining life as % of rated P/E endurance |
-| `yrs_left` | Extrapolated years of write life remaining at the current rolling wear rate. Shows `n/a` for the first 6 hours (not enough history yet), and `>100y` when the rate is so low the card is effectively not wearing out. |
+| `yrs_left` | Extrapolated years of write life remaining at the current rolling wear rate. Shows `n/a` for the first 24 hours (not enough history yet), and `>100y` when the rate is so low the card is effectively not wearing out. |
 
 ---
 
@@ -233,10 +233,10 @@ extrapolation survive daemon restarts and reboots without losing history.
   "reboot_count": 2,
   "wear_samples": [
     { "timestamp_secs": 1709100000, "flash_bytes_written": 900000000 },
-    { "timestamp_secs": 1709121600, "flash_bytes_written": 940000000 },
-    { "timestamp_secs": 1709143200, "flash_bytes_written": 987654321 }
+    { "timestamp_secs": 1709186400, "flash_bytes_written": 940000000 },
+    { "timestamp_secs": 1709272800, "flash_bytes_written": 987654321 }
   ],
-  "last_sample_timestamp": 1709143200
+  "last_sample_timestamp": 1709272800
 }
 ```
 
@@ -249,7 +249,7 @@ The key fields for card health are:
 | `initial_health_pct` | Health % that monitoring started at (100.0 = brand new; lower if `--initial-health` was used) |
 | `filesystem_fullness_pct` | How full the card was at last save — affects WAF |
 | `reboot_count` | Number of reboots detected since monitoring began |
-| `wear_samples` | Rolling ring buffer of 6-hourly wear snapshots (max 28 entries = 7 days) used to compute the `yrs_left` extrapolation |
+| `wear_samples` | Rolling ring buffer of 24-hourly wear snapshots (max 28 entries = 28 days) used to compute the `yrs_left` extrapolation |
 | `last_sample_timestamp` | Unix timestamp of the most recent wear sample push |
 
 ---
@@ -267,7 +267,7 @@ Wants=local-fs.target
 [Service]
 Type=simple
 ExecStartPre=/bin/mkdir -p /var/lib/sdwear
-ExecStart=/usr/local/bin/sdestimator --pe-cycles 1500 --interval 5 --save-interval 300
+ExecStart=/usr/local/bin/sdestimator --pe-cycles 1500 --interval 5 --save-interval 900
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -320,7 +320,7 @@ A fuller card means the FTL has less room to manoeuvre, forcing more frequent an
 
 ## Years Remaining Extrapolation
 
-The `yrs_left` value is derived from a **rolling 7-day wear rate ring buffer**. Every 6 hours a snapshot of `(timestamp, cumulative_flash_bytes_written)` is saved to the state file. Up to 28 snapshots are retained (4 per day × 7 days), adding only ~1.8 KB to the state file at full capacity.
+The `yrs_left` value is derived from a **rolling 28-day wear rate ring buffer**. Every 24 hours a snapshot of `(timestamp, cumulative_flash_bytes_written)` is saved to the state file. Up to 28 snapshots are retained (1 per day × 28 days), adding only ~1.8 KB to the state file at full capacity.
 
 To compute `yrs_left`:
 1. Take the oldest snapshot in the buffer as the start of the window
@@ -330,11 +330,11 @@ To compute `yrs_left`:
 
 | Display value | Meaning |
 |---|---|
-| `n/a` | Fewer than 2 samples in the buffer — need at least 6 hours of history |
+| `n/a` | Fewer than 2 samples in the buffer — need at least 24 hours of history |
 | `4.5y` | Estimated years remaining at current rolling wear rate |
 | `>100y` | Rate is so low the card is effectively not wearing out at current usage |
 
-The estimate naturally adapts as usage patterns change — a period of heavy writes will pull the estimate down, and a quieter period will let it recover upward. The 7-day window strikes a balance between responsiveness and stability.
+The estimate naturally adapts as usage patterns change — a period of heavy writes will pull the estimate down, and a quieter period will let it recover upward. The 28-day window strikes a balance between responsiveness and stability.
 
 ---
 
