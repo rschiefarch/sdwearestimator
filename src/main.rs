@@ -679,8 +679,11 @@ fn maybe_push_wear_sample(state: &mut State) {
 // life remain on the card at the current rate of wear.
 //
 // Algorithm:
-//   1. Take the oldest sample in the ring buffer as the start of the window
-//      (up to 28 days ago).
+//   1. Take the oldest sample in the ring buffer as the start of the window.
+//      If no persisted samples exist yet, fall back to the in-memory session
+//      start point (session_start_secs, session_start_flash_bytes) so that
+//      an estimate is produced as soon as any writes have been observed in
+//      the current session, even if the daemon just started.
 //   2. Compute bytes written and time elapsed over that window.
 //   3. Derive a wear rate in bytes/second.
 //   4. Compute remaining flash bytes capacity:
@@ -688,46 +691,54 @@ fn maybe_push_wear_sample(state: &mut State) {
 //   5. years_left = remaining_bytes / wear_rate / seconds_per_year
 //
 // Returns None if:
-//   - The ring buffer has fewer than 2 samples (not enough data yet — need at
-//     least 24 hours of history before the first estimate is produced)
-//   - The time window is zero (shouldn't happen but guard anyway)
+//   - The time window is zero (e.g. called in the same second as session start)
 //   - The wear rate is zero (no writes have occurred in the window)
 //
-// Returns Some(f64) capped at 100.0 — values above 100 years are displayed
-// as ">100y" since they are not meaningfully actionable.
+// No cap is applied — values above 100 years are displayed as-is (e.g. "143.2y").
 
-fn estimate_years_left(state: &State, card_bytes: u64, pe_cycles: u64) -> Option<f64> {
-    // Need at least two samples to compute a rate
-    if state.wear_samples.len() < 2 {
-        return None;
-    }
-
-    // The oldest sample defines the start of the rolling window (up to 28 days ago)
-    let oldest = &state.wear_samples[0];
+fn estimate_years_left(
+    state: &State,
+    card_bytes: u64,
+    pe_cycles: u64,
+    session_start_secs: u64,
+    session_start_flash_bytes: u64,
+) -> Option<f64> {
     let now_ts = now_secs();
 
+    // ── Determine the start of the estimation window ──
+    //
+    // Prefer the oldest persisted wear sample (up to 28 days of history).
+    // If no persisted samples exist yet, fall back to the in-memory session
+    // start so we can produce an estimate from the very first interval.
+    let (window_start_secs, window_start_bytes) = if !state.wear_samples.is_empty() {
+        // Use oldest persisted sample as the window start
+        let oldest = &state.wear_samples[0];
+        (oldest.timestamp_secs, oldest.flash_bytes_written)
+    } else {
+        // Fall back to session start — gives an estimate based purely on
+        // what has been observed since the daemon started this session
+        (session_start_secs, session_start_flash_bytes)
+    };
+
     // Time elapsed over the window in seconds
-    let elapsed_secs = now_ts.saturating_sub(oldest.timestamp_secs);
+    let elapsed_secs = now_ts.saturating_sub(window_start_secs);
     if elapsed_secs == 0 {
         return None;
     }
 
     // Flash bytes written during the window
     let bytes_in_window = state.estimated_flash_bytes_written
-        .saturating_sub(oldest.flash_bytes_written);
+        .saturating_sub(window_start_bytes);
 
     // If no bytes were written in the window the rate is zero — cannot extrapolate
     if bytes_in_window == 0 {
         return None;
     }
 
-    // Wear rate in bytes per second over the rolling window
+    // Wear rate in bytes per second over the window
     let bytes_per_sec = bytes_in_window as f64 / elapsed_secs as f64;
 
-    // Total flash write capacity of the card:
-    //   capacity = pe_cycles_rated * card_bytes
-    // Remaining capacity based on current life percentage:
-    //   remaining = (life_remaining_pct / 100.0) * capacity
+    // Total remaining flash write capacity based on current life percentage
     let remaining_flash_bytes =
         (state.estimated_life_remaining_pct / 100.0) * (pe_cycles as f64 * card_bytes as f64);
 
@@ -736,21 +747,22 @@ fn estimate_years_left(state: &State, card_bytes: u64, pe_cycles: u64) -> Option
 
     let years = remaining_flash_bytes / bytes_per_sec / secs_per_year;
 
-    // Cap at 100.0 — anything above this is displayed as ">100y"
-    Some(years.min(100.0))
+    // No cap — return the full extrapolated value regardless of magnitude
+    Some(years)
 }
 
 /// Format the years-left value for display in the output line.
-/// - None            → "n/a"   (not enough data yet — less than 24 hours of history)
-/// - Some(100.0)     → ">100y" (capped — effectively infinite at current rate)
-/// - Some(x)         → "4.5y"  (one decimal place)
+/// - None       → "n/a"    (no writes observed yet in window)
+/// - Some(x)    → "143.2y" (one decimal place, no upper cap)
 fn format_years_left(years: Option<f64>) -> String {
     match years {
         None => "n/a".to_string(),
-        Some(y) if y >= 100.0 => ">100y".to_string(),
         Some(y) => format!("{:.1}y", y),
     }
 }
+
+
+
 
 // ─── Persistence ───
 
@@ -779,6 +791,7 @@ fn now_string() -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
 
     // ── Validate --initial-health if provided ──
     // Must be in the range 0.0 to 100.0 inclusive. We check this early so the
@@ -845,6 +858,7 @@ fn main() -> Result<()> {
     let state_file_existed = args.state_file.exists();
 
     let mut state = load_state(&args.state_file);
+
 
     // ── Apply --initial-health only when starting fresh (no prior state file) ──
     //
@@ -943,6 +957,10 @@ fn main() -> Result<()> {
     );
     println!("─────────────────────────────────────────────────────────────");
 
+    // ── Capture session start point ──
+    let session_start_secs = now_secs();
+    let session_start_flash_bytes = state.estimated_flash_bytes_written;
+
     let mut prev = current;
 
     // Track wall-clock time since last save rather than counting ticks.
@@ -1019,7 +1037,15 @@ fn main() -> Result<()> {
             maybe_push_wear_sample(&mut state);
 
             // ── Compute years-left extrapolation from rolling wear rate ──
-            let years_left = estimate_years_left(&state, card_bytes, args.pe_cycles);
+            //let years_left = estimate_years_left(&state, card_bytes, args.pe_cycles);
+            let years_left = estimate_years_left(
+                &state,
+                card_bytes,
+                args.pe_cycles,
+                session_start_secs,
+                session_start_flash_bytes,
+            );
+
             let years_str = format_years_left(years_left);
 
             // ── Print labeled key=value output line ──
