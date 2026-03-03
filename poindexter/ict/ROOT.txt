@@ -1,6 +1,13 @@
 
-standard linux rust stack
+standard linux rust stack. small efficient binary that uses kernel io stats
+    to estimate the lifetime of an sd card based on configured params such as write cycle durability
 
 one source file src.main.rs
+
+generally would be run as a systemd daemon
+
+sample unit file at /sdwear.systemd.service
+
+building with musl rather than gnu libc makes a much smaller binary - 660k vs 3.4m
 
 when i say run the raspi build i mean specifically raspi4 - aarch64 with musl lib NOT gnu libc

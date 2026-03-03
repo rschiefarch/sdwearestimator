@@ -1,11 +1,11 @@
 <dexUnit>
     <name>sdestimator</name>
-    <appType>sd card write wear estimator</appType>
+    <appType>rust std</appType>
     <!-- baseDir>../</baseDir -->
     <readOnly>true</readOnly>
     <!-- specBase>/src/main/java/au/com/apirosolutions/acme/srv/spec</specBase -->
     <description>
-        small binary that runs on linux and estimates block write cound for sd card that a filesystem is mounted on
+        small binary that runs on linux and estimates block write cound for sd card that a filesystem is mounted on.
     </description>
     <ictRefs>
         <ictRef>

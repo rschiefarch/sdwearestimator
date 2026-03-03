@@ -2,7 +2,8 @@
 <dexSolution>
     <name>SDWAER</name>
     <description>
-        this is an embedded rust project for esp32 soc
+        this is a simple linux/unix utility to be able to estimate sd card life based on card specs and io stats from the kernel.
+        only one dexunit - which is the associated rust code
     </description>
     <dexUnitRefs>
         <dexUnitRef>
