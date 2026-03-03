@@ -985,6 +985,16 @@ fn main() -> Result<()> {
                 args.over_provision,
             );
 
+            // ── Compute sequential ratio for display ──
+            // Mirrors the calculation inside estimate_waf() so we can log it.
+            let total_io_events = delta_ios + delta_merges;
+            let seq_ratio = if total_io_events > 0 {
+                delta_merges as f64 / total_io_events as f64
+            } else {
+                0.0
+            };
+
+
             let delta_flash_bytes = (delta_host_bytes as f64 * waf) as u64;
 
             // Update cumulative state
@@ -1016,16 +1026,18 @@ fn main() -> Result<()> {
             // Using key=value format so each line is self-describing in the
             // systemd journal even when the header has scrolled out of view.
             println!(
-                "ios={} kb={} avg_kb={:.1} waf={:.2} full={:.1}% pe={:.6} life={:.4}% yrs_left={}",
+                "ios={} kb={} avg_kb={:.1} waf={:.2} seq={:.2} full={:.1}% pe={:.6} life={:.4}% yrs_left={}",
                 delta_ios,
                 delta_kb,
                 avg_io_kb,
                 waf,
+                seq_ratio,
                 fullness * 100.0,
                 state.estimated_avg_pe_cycles,
                 state.estimated_life_remaining_pct,
                 years_str,
             );
+
         }
 
         prev = now;

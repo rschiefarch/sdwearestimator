@@ -3,3 +3,4 @@ standard linux rust stack
 
 one source file src.main.rs
 
+when i say run the raspi build i mean specifically raspi4 - aarch64 with musl lib NOT gnu libc
